@@ -1,0 +1,220 @@
+#!/opt/homebrew/bin/bash
+# kube-select: TUI for selecting and connecting to GKE clusters across GCP projects
+set -euo pipefail
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+die()  { printf "${RED}ERROR: %s${RESET}\n" "$*" >&2; exit 1; }
+info() { printf "${CYAN}▸ %s${RESET}\n" "$*"; }
+ok()   { printf "${GREEN}✔ %s${RESET}\n" "$*"; }
+
+check_deps() {
+  command -v gcloud >/dev/null 2>&1 || die "gcloud CLI not found. Install: https://cloud.google.com/sdk/docs/install"
+  command -v kubectl >/dev/null 2>&1 || die "kubectl not found. Install: brew install kubectl"
+}
+
+has_fzf() { command -v fzf >/dev/null 2>&1; }
+
+# ── Selection UI ─────────────────────────────────────────────────────────────
+
+# Simple numbered-menu fallback when fzf is not available
+select_menu() {
+  local prompt="$1"
+  shift
+  local items=("$@")
+  local count=${#items[@]}
+
+  if [[ $count -eq 0 ]]; then
+    return 1
+  fi
+
+  printf "\n${BOLD}%s${RESET}\n" "$prompt"
+  for i in "${!items[@]}"; do
+    printf "  ${YELLOW}%3d${RESET}  %s\n" "$((i + 1))" "${items[$i]}"
+  done
+
+  while true; do
+    printf "\n${CYAN}Enter number [1-%d] (q to quit): ${RESET}" "$count"
+    read -r choice
+    if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
+      exit 0
+    fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )); then
+      SELECTED="${items[$((choice - 1))]}"
+      return 0
+    fi
+    printf "${RED}Invalid selection.${RESET}\n"
+  done
+}
+
+# Use fzf if available, otherwise fall back to numbered menu
+pick() {
+  local prompt="$1"
+  shift
+  local items=("$@")
+
+  if [[ ${#items[@]} -eq 0 ]]; then
+    return 1
+  fi
+
+  if has_fzf; then
+    SELECTED=$(printf '%s\n' "${items[@]}" | fzf --height=~40% --border --prompt="$prompt > " --header="  ↑↓ navigate  enter select  esc quit" --no-multi) || exit 0
+  else
+    select_menu "$prompt" "${items[@]}"
+  fi
+}
+
+# ── GCP / GKE queries ───────────────────────────────────────────────────────
+
+list_projects() {
+  info "Fetching GCP projects…"
+  local raw
+  raw=$(gcloud projects list --format='value(projectId,name)' --sort-by=projectId 2>/dev/null) || die "Failed to list projects. Run 'gcloud auth login' first."
+  if [[ -z "$raw" ]]; then
+    die "No GCP projects found for current account."
+  fi
+  # Format: "project-id  (Project Name)"
+  while IFS=$'\t' read -r id name; do
+    printf '%s  (%s)\n' "$id" "$name"
+  done <<< "$raw"
+}
+
+list_clusters() {
+  local project="$1"
+  info "Fetching GKE clusters in project ${BOLD}${project}${RESET}…"
+  local raw
+  raw=$(gcloud container clusters list --project="$project" \
+        --format='value(name,location,status,currentNodeCount)' 2>/dev/null) || die "Failed to list clusters in $project."
+  if [[ -z "$raw" ]]; then
+    printf "${YELLOW}No GKE clusters found in project %s.${RESET}\n" "$project"
+    return 1
+  fi
+  while IFS=$'\t' read -r name location status nodes; do
+    printf '%-30s  %-20s  status=%-10s  nodes=%s\n' "$name" "$location" "$status" "$nodes"
+  done <<< "$raw"
+}
+
+get_credentials() {
+  local project="$1" cluster="$2" location="$3"
+  info "Fetching credentials for ${BOLD}${cluster}${RESET} in ${location}…"
+  gcloud container clusters get-credentials "$cluster" \
+    --project="$project" \
+    --location="$location" \
+    --quiet || die "Failed to get credentials."
+  ok "kubectl configured for cluster ${BOLD}${cluster}${RESET}"
+}
+
+# ── Show current context ────────────────────────────────────────────────────
+
+show_current() {
+  local ctx
+  ctx=$(kubectl config current-context 2>/dev/null || echo "(none)")
+  printf "\n${BOLD}Current context:${RESET} ${GREEN}%s${RESET}\n" "$ctx"
+
+  if [[ "$ctx" != "(none)" ]]; then
+    local server
+    server=$(kubectl config view -o jsonpath="{.clusters[?(@.name==\"$(kubectl config view -o jsonpath="{.contexts[?(@.name==\"$ctx\")].context.cluster}")\")].cluster.server}" 2>/dev/null || echo "unknown")
+    printf "${DIM}  Server: %s${RESET}\n" "$server"
+  fi
+}
+
+# ── Quick-switch: pick from existing kubeconfig contexts ────────────────────
+
+switch_context() {
+  local contexts
+  mapfile -t contexts < <(kubectl config get-contexts -o name 2>/dev/null)
+  if [[ ${#contexts[@]} -eq 0 ]]; then
+    die "No contexts in kubeconfig."
+  fi
+
+  local current
+  current=$(kubectl config current-context 2>/dev/null || echo "")
+
+  # Mark the current context
+  local display=()
+  for c in "${contexts[@]}"; do
+    if [[ "$c" == "$current" ]]; then
+      display+=("* $c  (current)")
+    else
+      display+=("  $c")
+    fi
+  done
+
+  pick "Switch context" "${display[@]}"
+  # Strip leading marker and trailing "(current)"
+  local chosen
+  chosen=$(echo "$SELECTED" | sed 's/^[* ]*//' | sed 's/  *(current)$//')
+  kubectl config use-context "$chosen" >/dev/null
+  ok "Switched to ${BOLD}${chosen}${RESET}"
+  show_current
+}
+
+# ── Main flow ────────────────────────────────────────────────────────────────
+
+main_flow() {
+  # Step 1: pick project
+  local projects_raw
+  mapfile -t projects_raw < <(list_projects)
+  pick "Select GCP Project" "${projects_raw[@]}"
+
+  local project
+  project=$(echo "$SELECTED" | awk '{print $1}')
+
+  # Step 2: pick cluster
+  local clusters_raw
+  mapfile -t clusters_raw < <(list_clusters "$project")
+  if [[ ${#clusters_raw[@]} -eq 0 ]]; then
+    die "No clusters available."
+  fi
+  pick "Select GKE Cluster" "${clusters_raw[@]}"
+
+  local cluster location
+  cluster=$(echo "$SELECTED" | awk '{print $1}')
+  location=$(echo "$SELECTED" | awk '{print $2}')
+
+  # Step 3: get credentials
+  get_credentials "$project" "$cluster" "$location"
+  show_current
+}
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+${BOLD}kube-select${RESET} — TUI for managing GKE cluster connections
+
+${BOLD}Usage:${RESET}
+  kube-select              Interactive: pick project → cluster → connect
+  kube-select switch       Quick-switch between existing kubeconfig contexts
+  kube-select current      Show current cluster context
+  kube-select help         Show this help
+
+${BOLD}Dependencies:${RESET}
+  Required: gcloud, kubectl
+  Optional: fzf (for fuzzy-search UI; falls back to numbered menu)
+
+${BOLD}Shell prompt integration:${RESET}
+  Source the companion kube-prompt.sh to show your active cluster in the prompt.
+  Add to ~/.zshrc:
+    source /path/to/kube-prompt.sh
+EOF
+}
+
+check_deps
+
+case "${1:-}" in
+  switch|sw)   switch_context ;;
+  current|cur) show_current ;;
+  help|--help|-h) usage ;;
+  *)           main_flow ;;
+esac
