@@ -7,15 +7,19 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
 
+# Special markers
+ORBSTACK_MARKER='__orbstack__'
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 die()  { printf "${RED}ERROR: %s${RESET}\n" "$*" >&2; exit 1; }
-info() { printf "${CYAN}▸ %s${RESET}\n" "$*"; }
+info() { printf "${CYAN}▸ %s${RESET}\n" "$*" >&2; }
 ok()   { printf "${GREEN}✔ %s${RESET}\n" "$*"; }
 
 check_deps() {
@@ -23,11 +27,8 @@ check_deps() {
   command -v kubectl >/dev/null 2>&1 || die "kubectl not found. Install: brew install kubectl"
 }
 
-has_fzf() { command -v fzf >/dev/null 2>&1; }
-
 # ── Selection UI ─────────────────────────────────────────────────────────────
 
-# Simple numbered-menu fallback when fzf is not available
 select_menu() {
   local prompt="$1"
   shift
@@ -40,7 +41,12 @@ select_menu() {
 
   printf "\n${BOLD}%s${RESET}\n" "$prompt"
   for i in "${!items[@]}"; do
-    printf "  ${YELLOW}%3d${RESET}  %s\n" "$((i + 1))" "${items[$i]}"
+    if [[ "${items[$i]}" == *"$ORBSTACK_MARKER"* ]]; then
+      local display_item="${items[$i]//$ORBSTACK_MARKER/}"
+      printf "  ${MAGENTA}%3d  %s${RESET}\n" "$((i + 1))" "$display_item"
+    else
+      printf "  ${YELLOW}%3d${RESET}  %s\n" "$((i + 1))" "${items[$i]}"
+    fi
   done
 
   while true; do
@@ -51,13 +57,13 @@ select_menu() {
     fi
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )); then
       SELECTED="${items[$((choice - 1))]}"
+      SELECTED="${SELECTED//$ORBSTACK_MARKER/}"
       return 0
     fi
     printf "${RED}Invalid selection.${RESET}\n"
   done
 }
 
-# Use fzf if available, otherwise fall back to numbered menu
 pick() {
   local prompt="$1"
   shift
@@ -67,11 +73,7 @@ pick() {
     return 1
   fi
 
-  if has_fzf; then
-    SELECTED=$(printf '%s\n' "${items[@]}" | fzf --height=~40% --border --prompt="$prompt > " --header="  ↑↓ navigate  enter select  esc quit" --no-multi) || exit 0
-  else
-    select_menu "$prompt" "${items[@]}"
-  fi
+  select_menu "$prompt" "${items[@]}"
 }
 
 # ── GCP / GKE queries ───────────────────────────────────────────────────────
@@ -161,14 +163,32 @@ switch_context() {
 
 # ── Main flow ────────────────────────────────────────────────────────────────
 
+connect_orbstack() {
+  local ctx
+  ctx=$(kubectl config get-contexts -o name 2>/dev/null | grep -i orbstack | head -1)
+  if [[ -z "$ctx" ]]; then
+    die "No OrbStack context found in kubeconfig. Is OrbStack running?"
+  fi
+  kubectl config use-context "$ctx" >/dev/null
+  ok "Switched to local OrbStack cluster: ${BOLD}${ctx}${RESET}"
+  show_current
+}
+
 main_flow() {
-  # Step 1: pick project
+  # Step 1: pick project (with local OrbStack option)
   local projects_raw
   mapfile -t projects_raw < <(list_projects)
+  projects_raw=("orbstack  (Local Kubernetes)${ORBSTACK_MARKER}" "${projects_raw[@]}")
   pick "Select GCP Project" "${projects_raw[@]}"
 
   local project
   project=$(echo "$SELECTED" | awk '{print $1}')
+
+  # Handle OrbStack selection
+  if [[ "$project" == "orbstack" ]]; then
+    connect_orbstack
+    return
+  fi
 
   # Step 2: pick cluster
   local clusters_raw
@@ -201,7 +221,6 @@ ${BOLD}Usage:${RESET}
 
 ${BOLD}Dependencies:${RESET}
   Required: gcloud, kubectl
-  Optional: fzf (for fuzzy-search UI; falls back to numbered menu)
 
 ${BOLD}Shell prompt integration:${RESET}
   Source the companion kube-prompt.sh to show your active cluster in the prompt.
